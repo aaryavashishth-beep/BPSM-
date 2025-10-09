@@ -1,0 +1,229 @@
+bash <<'EOF'
+set -e
+OUTDIR="/home/s2831761/ICA1_MyFirstPipeline/output"
+TEMP_DIR=$(mktemp -d) # Create a secure temporary directory
+
+echo "--- Assembling matrix using temporary files (most compatible method) ---"
+
+# Step A: Get the list of count files
+count_files=("$OUTDIR"/Counts/*_counts.txt)
+
+# Step B: Create a temporary file for the gene names (first column)
+cut -f4 "${count_files[0]}" > "$TEMP_DIR/col_genes.txt"
+
+# Step C: Create a temporary file for each sample's counts
+i=1
+for file in "${count_files[@]}"; do
+    cut -f7 "$file" > "$TEMP_DIR/col_${i}.txt"
+    i=$((i + 1))
+done
+
+# Step D: Paste all the temporary files together
+paste "$TEMP_DIR"/col_*.txt > "$OUTDIR/Stats/all_counts_matrix.tsv"
+
+# Step E: Clean up the temporary directory
+rm -r "$TEMP_DIR"
+
+# Step F: Add the header back to the final matrix
+header="gene"
+for file in "${count_files[@]}"; do
+    sample=$(basename "$file" _counts.txt)
+    header="$header\t$sample"
+done
+sed -i "1i $header" "$OUTDIR/Stats/all_counts_matrix.tsv"
+
+echo "--- SUCCESS: The matrix file was created ---"
+ls -lh "$OUTDIR/Stats/all_counts_matrix.tsv"
+head -n 3 "$OUTDIR/Stats/all_counts_matrix.tsv"
+EOF
+
+#!/bin/bash
+#
+# RNA-seq Pipeline for Trypanosoma congolense
+# A robust and universally compatible bash script for read alignment and gene counting.
+#
+
+set -e # Exit immediately if a command exits with a non-zero status.
+set -o pipefail # Exit if any command in a pipeline fails, not just the last one.
+
+# --- Configuration ---
+## Define essential paths and parameters for the pipeline.
+PROJECT_DIR="/home/s2831761/ICA1_MyFirstPipeline"
+FASTQ_DIR="/localdisk/data/BPSM/MyFirstPipeline/fastq"
+GENOME_DIR="$PROJECT_DIR/genome"
+GENOME_INDEX="$GENOME_DIR/Tcongo_genome"
+BEDFILE="/localdisk/data/BPSM/MyFirstPipeline/TriTrypDB-46_TcongolenseIL3000_2019.bed"
+OUTDIR="$PROJECT_DIR/output"
+
+## Set processing resources.
+THREADS=4
+MEM_PER_THREAD="1G" # Memory for samtools sort (e.g., 1G, 500M).
+
+## Define experimental groups for differential analysis.
+GROUP1_SAMPLES=3 # Number of samples in the first condition.
+
+# --- Setup ---
+## Create a main log file to capture ALL output for easier debugging.
+mkdir -p "$PROJECT_DIR/Logs"
+LOG_FILE="$PROJECT_DIR/Logs/pipeline_$(date +%F_%H-%M-%S).log"
+exec > >(tee -a "$LOG_FILE") 2>&1 # Redirect stdout and stderr to both screen and log file.
+
+echo "--- RNA-seq Pipeline Started: $(date) ---"
+echo "Project Directory: $PROJECT_DIR"
+echo "Output Directory: $OUTDIR"
+echo "Log File: $LOG_FILE"
+echo "Threads: $THREADS | Memory per Thread: $MEM_PER_THREAD"
+echo "----------------------------------------------------"
+
+## Create the directory structure for pipeline outputs.
+echo ">> Step 1: Creating output directories..."
+mkdir -p "$OUTDIR/QC" "$OUTDIR/Alignments" "$OUTDIR/Counts" "$OUTDIR/Logs" "$OUTDIR/Stats"
+echo "Done."
+
+# --- Main Pipeline Steps ---
+
+## Step 2: Quality Control
+echo ">> Step 2: Running FastQC for quality control..."
+for fq in "$FASTQ_DIR"/*.fq.gz; do
+    sample_name=$(basename "$fq" .fq.gz)
+    if [ -f "$OUTDIR/QC/${sample_name}_fastqc.html" ]; then
+        echo "FastQC report for $sample_name already exists. Skipping."
+    else
+        echo "Processing $sample_name..."
+        fastqc -t $THREADS -o "$OUTDIR/QC" "$fq"
+    fi
+done
+echo "FastQC complete."
+
+## Step 3: Raw Read Counts
+echo ">> Step 3: Counting raw reads in FASTQ files..."
+{
+    echo -e "Sample\tRawReadCount"
+    for fq in "$FASTQ_DIR"/*.fq.gz; do
+        total_lines=$(zcat "$fq" | wc -l)
+        reads=$((total_lines / 4))
+        echo -e "$(basename "$fq")\t$reads"
+    done
+} > "$OUTDIR/Stats/raw_read_counts.tsv"
+echo "Raw read counts saved to Stats/raw_read_counts.tsv."
+
+## Step 4: Alignment and Sorting
+echo ">> Step 4: Aligning reads to reference genome..."
+for r1_file in "$FASTQ_DIR"/*_1.fq.gz; do
+    r2_file="${r1_file/_1.fq.gz/_2.fq.gz}"
+    sample_name=$(basename "$r1_file" _1.fq.gz)
+    output_bam="$OUTDIR/Alignments/${sample_name}_sorted.bam"
+
+    if [ ! -f "$r2_file" ]; then
+        echo "Warning: Paired file $r2_file not found for $r1_file. Skipping."
+        continue
+    fi
+
+    if [ -f "$output_bam" ]; then
+        echo "Aligned BAM for $sample_name already exists. Skipping."
+    else
+        echo "Aligning sample $sample_name..."
+        
+        # Stream output from bowtie2 directly to samtools to save disk space and time.
+        bowtie2 -x "$GENOME_INDEX" -1 "$r1_file" -2 "$r2_file" --threads "$THREADS" \
+            2> "$OUTDIR/Logs/${sample_name}_bowtie2.log" | \
+        samtools view -@ "$THREADS" -bS - | \
+        samtools sort -@ "$THREADS" -m "$MEM_PER_THREAD" -o "$output_bam" -
+
+        echo "Indexing BAM for $sample_name..."
+        samtools index "$output_bam"
+    fi
+done
+echo "Alignment complete."
+
+## Step 5: Read Counting per Gene
+echo ">> Step 5: Counting reads per gene with bedtools..."
+for bam_file in "$OUTDIR/Alignments"/*_sorted.bam; do
+    sample_name=$(basename "$bam_file" _sorted.bam)
+    output_counts="$OUTDIR/Counts/${sample_name}_counts.txt"
+
+    if [ -f "$output_counts" ]; then
+        echo "Counts file for $sample_name already exists. Skipping."
+    else
+        echo "Counting for $sample_name..."
+        bedtools coverage -a "$BEDFILE" -b "$bam_file" > "$output_counts"
+    fi
+done
+echo "Read counting complete."
+
+## Step 6: Create Gene Count Matrix (Most Compatible Method)
+echo ">> Step 6: Assembling gene x sample count matrix..."
+count_files=("$OUTDIR"/Counts/*_counts.txt)
+if [ ${#count_files[@]} -eq 0 ]; then
+    echo "Error: No count files found. Cannot create matrix." >&2
+    exit 1
+fi
+
+# Use temporary files to avoid advanced shell features that may not be supported.
+TEMP_DIR=$(mktemp -d)
+# Create a temporary file for the gene names (first column).
+cut -f4 "${count_files[0]}" > "$TEMP_DIR/col_genes.txt"
+# Create a temporary file for each sample's counts.
+i=1
+for file in "${count_files[@]}"; do
+    cut -f7 "$file" > "$TEMP_DIR/col_${i}.txt"
+    i=$((i + 1))
+done
+# Paste all the temporary files together into the final matrix.
+paste "$TEMP_DIR"/col_*.txt > "$OUTDIR/Stats/all_counts_matrix.tsv"
+# Clean up the temporary directory.
+rm -r "$TEMP_DIR"
+
+# Add the header row to the final matrix.
+header="gene"
+for file in "${count_files[@]}"; do
+    sample=$(basename "$file" _counts.txt)
+    header="$header\t$sample"
+done
+sed -i "1i $header" "$OUTDIR/Stats/all_counts_matrix.tsv"
+echo "Count matrix created: Stats/all_counts_matrix.tsv"
+
+## Step 7: Calculate Fold Change
+echo ">> Step 7: Calculating fold change between groups..."
+counts_matrix="$OUTDIR/Stats/all_counts_matrix.tsv"
+num_samples=$(head -n1 "$counts_matrix" | awk '{print NF-1}')
+if [ "$num_samples" -lt 2 ]; then
+    echo "Warning: Not enough samples for fold-change calculation. Skipping."
+else
+    # Use a single, robust awk command for all calculations.
+    awk -v g1_samples="$GROUP1_SAMPLES" -F'\t' '
+    function log2(x) { return log(x)/log(2) }
+    NR == 1 {print "gene\tmean_group1\tmean_group2\tlog2FC"; next}
+    {
+        gene = $1;
+        sum1=0;
+        sum2=0;
+        
+        # Sum group 1 (cols 2 to g1_samples+1)
+        for (i=2; i<=g1_samples+1; i++) { sum1+=$i; }
+        
+        # Sum group 2 (cols g1_samples+2 to end)
+        g2_samples = NF - 1 - g1_samples;
+        for (i=g1_samples+2; i<=NF; i++) { sum2+=$i; }
+        
+        mean1 = sum1 / g1_samples;
+        mean2 = (g2_samples > 0) ? sum2 / g2_samples : 0;
+        
+        # Add a small pseudocount to handle zeros gracefully for log2 calculation.
+        mean1_pseudo = mean1 + 0.01;
+        mean2_pseudo = mean2 + 0.01;
+        
+        log2fc = sprintf("%.4f", log2(mean1_pseudo / mean2_pseudo));
+        
+        printf "%s\t%.4f\t%.4f\t%s\n", gene, mean1, mean2, log2fc;
+    }' "$counts_matrix" > "$OUTDIR/Stats/fold_change_results.tsv"
+    
+    echo "Fold change results saved to Stats/fold_change_results.tsv."
+fi
+
+echo "----------------------------------------------------"
+echo "--- Pipeline Finished Successfully: $(date) ---"
+echo "All results are in: $OUTDIR"
+echo "Final count matrix: $OUTDIR/Stats/all_counts_matrix.tsv"
+echo "Fold change analysis: $OUTDIR/Stats/fold_change_results.tsv"
+echo "----------------------------------------------------"
