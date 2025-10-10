@@ -1,4 +1,4 @@
-# MyFirstPipeline
+# BPSM - ICA - 1 - MyFirstPipeline
 ##  The "MyFirstPipeline" Workflow
 
 The overall vision is to have an automated script, using `bash` and/or `awk`, to execute a standard RNAseq analysis workflow from start to finish. The vision is to be as far along as possible towards making it usable with minimal input needed other than executing the program.
